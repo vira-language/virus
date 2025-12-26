@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,11 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/bindings/containers"
+	"github.com/containers/podman/v5/pkg/bindings/images"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/specgen"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pterm/pterm"
 	"github.com/schollz/progressbar/v3"
@@ -20,17 +26,18 @@ import (
 )
 
 const (
-	indexURL      = "https://raw.githubusercontent.com/vira-language/vira/main/repository/virus.json"
-	depsDir       = ".virus_deps"
-	projectTOML   = "Project.toml"
-	projectYAML   = "Project.yaml"
-	projectJSON   = "Project.json"
+	indexURL     = "https://raw.githubusercontent.com/vira-language/vira/main/repository/virus.json"
+	depsDir      = ".virus_deps"
+	projectTOML  = "Project.toml"
+	projectYAML  = "Project.yaml"
+	projectJSON  = "Project.json"
+	wolfiImage   = "cgr.dev/chainguard/wolfi-base:latest"
 )
 
 var binPath string
 
 type Config struct {
-	Package     Package     `toml:"package" yaml:"package" json:"package"`
+	Package      Package           `toml:"package" yaml:"package" json:"package"`
 	Dependencies map[string]string `toml:"dependencies" yaml:"dependencies" json:"dependencies"`
 }
 
@@ -44,7 +51,7 @@ type LibraryIndex struct {
 }
 
 type Library struct {
-	Name     string    `json:"name"`
+	Name     string   `json:"name"`
 	Versions []Version `json:"versions"`
 }
 
@@ -135,15 +142,15 @@ func initProject() {
 	}
 
 	mainCode := `int main() {
-    return 0;
+	return 0;
 }
 `
-	if err := os.WriteFile("src/main.vira", []byte(mainCode), 0644); err != nil {
-		pterm.Error.Println("Failed to write main.vira:", err)
-		os.Exit(1)
-	}
+if err := os.WriteFile("src/main.vira", []byte(mainCode), 0644); err != nil {
+	pterm.Error.Println("Failed to write main.vira:", err)
+	os.Exit(1)
+}
 
-	pterm.Success.Println("Project initialized")
+pterm.Success.Println("Project initialized")
 }
 
 func addDependency(lib string) {
@@ -155,7 +162,7 @@ func addDependency(lib string) {
 		os.Exit(1)
 	}
 
-	config.Dependencies[lib] = "*" // Default to latest
+	config.Dependencies[lib] = "*"
 
 	if err := saveConfig(config); err != nil {
 		pterm.Error.Println(err)
@@ -174,18 +181,100 @@ func compileProject() {
 		os.Exit(1)
 	}
 
+	tempDir, err := os.MkdirTemp("", "virus-build-*")
+	if err != nil {
+		pterm.Error.Println("Failed to create temp dir:", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(tempDir)
+
+	projectFile := findProjectFile()
+	if projectFile == "" {
+		pterm.Error.Println("No project file found")
+		os.Exit(1)
+	}
+
+	if err := copyFile(projectFile, filepath.Join(tempDir, filepath.Base(projectFile))); err != nil {
+		pterm.Error.Println("Failed to copy project file:", err)
+		os.Exit(1)
+	}
+
+	if err := copyDir("src", filepath.Join(tempDir, "src")); err != nil {
+		pterm.Error.Println("Failed to copy src dir:", err)
+		os.Exit(1)
+	}
+
+	depsDirTemp := filepath.Join(tempDir, depsDir)
+	if err := os.MkdirAll(depsDirTemp, 0755); err != nil {
+		pterm.Error.Println("Failed to create deps dir:", err)
+		os.Exit(1)
+	}
+
 	index, err := downloadIndex()
 	if err != nil {
 		pterm.Error.Println("Failed to download index:", err)
 		os.Exit(1)
 	}
 
-	if err := os.MkdirAll(depsDir, 0755); err != nil {
-		pterm.Error.Println("Failed to create deps dir:", err)
+	depPaths := []string{}
+	objectFilesContainer := []string{}
+
+	ctx := context.Background()
+	conn, err := bindings.NewConnection(ctx, "unix:///run/podman/podman.sock")
+	if err != nil {
+		pterm.Error.Println("Failed to connect to Podman:", err)
 		os.Exit(1)
 	}
 
-	includePaths := []string{}
+	_, err = images.Pull(conn, wolfiImage, nil)
+	if err != nil {
+		pterm.Error.Println("Failed to pull Wolfi image:", err)
+		os.Exit(1)
+	}
+
+	s, err := specgen.NewSpecGenerator(wolfiImage, false)
+	if err != nil {
+		pterm.Error.Println("Failed to create spec:", err)
+		os.Exit(1)
+	}
+
+	s.Mounts = []specgen.Mount{
+		{Type: "bind", Source: tempDir, Destination: "/work", Options: []string{"rw"}},
+		{Type: "bind", Source: binPath, Destination: "/vira-bin", Options: []string{"ro"}},
+	}
+	s.WorkDir = "/work"
+	s.Command = []string{"/bin/sh", "-c", "while true; do sleep 100000; done"}
+
+	created, err := containers.CreateWithSpec(conn, s, nil)
+	if err != nil {
+		pterm.Error.Println("Failed to create container:", err)
+		os.Exit(1)
+	}
+
+	containerID := created.ID
+
+	if err := containers.Start(conn, containerID, nil); err != nil {
+		pterm.Error.Println("Failed to start container:", err)
+		os.Exit(1)
+	}
+
+	defer func() {
+		containers.Stop(conn, containerID, nil)
+		containers.Remove(conn, containerID, nil)
+	}()
+
+	out, exit, err := execInContainer(conn, containerID, []string{"apk", "update"})
+	if err != nil || exit != 0 {
+		pterm.Error.Println("apk update failed:", out, err)
+		os.Exit(1)
+	}
+
+	out, exit, err = execInContainer(conn, containerID, []string{"apk", "add", "--no-cache", "build-base", "gcc", "g++"})
+	if err != nil || exit != 0 {
+		pterm.Error.Println("apk add failed:", out, err)
+		os.Exit(1)
+	}
+
 	for name, versionSpec := range config.Dependencies {
 		lib := findLibrary(index, name)
 		if lib == nil {
@@ -199,7 +288,7 @@ func compileProject() {
 			os.Exit(1)
 		}
 
-		depPath := filepath.Join(depsDir, name, version.Version)
+		depPath := filepath.Join(depsDirTemp, name, version.Version)
 		if err := os.MkdirAll(depPath, 0755); err != nil {
 			pterm.Error.Println("Failed to create dep path:", err)
 			os.Exit(1)
@@ -216,115 +305,216 @@ func compileProject() {
 			}
 		}
 
-		includePaths = append(includePaths, depPath)
-	}
+		depPaths = append(depPaths, depPath)
 
-	// Assume main file is src/main.vira
-	inputFile := "src/main.vira"
-	outputPre := inputFile + ".pre"
-	outputObj := inputFile + ".o"
+		ext := strings.ToLower(filepath.Ext(fileName))
+		containerInput := strings.Replace(targetFile, tempDir, "/work", 1)
+		containerO := strings.Replace(depPath, tempDir, "/work", 1) + "/lib.o"
 
-	// For isolation, simulate with chdir or env, but for now local
-	// TODO: Implement wolfi-like isolation, perhaps using os.Chdir to a temp dir with mounts
-
-	pterm.DefaultSection.Println("Preprocessing")
-	preprocessor := filepath.Join(binPath, "preprocessor")
-	if runtime.GOOS == "windows" {
-		preprocessor += ".exe"
-	}
-	cmdPreArgs := []string{inputFile, outputPre}
-	for _, path := range includePaths {
-		cmdPreArgs = append(cmdPreArgs, "-I", path) // Assume preprocessor supports -I
-	}
-	cmdPre := exec.Command(preprocessor, cmdPreArgs...)
-	if out, err := cmdPre.CombinedOutput(); err != nil {
-		handleError(inputFile, string(out))
-		os.Exit(1)
-	}
-	pterm.Success.Println("Preprocessing done")
-
-	pterm.DefaultSection.Println("Parsing and Checking")
-	plsa := filepath.Join(binPath, "plsa")
-	if runtime.GOOS == "windows" {
-		plsa += ".exe"
-	}
-	cmdPlsa := exec.Command(plsa, outputPre)
-	if out, err := cmdPlsa.CombinedOutput(); err != nil {
-		handleError(outputPre, string(out))
-		os.Exit(1)
-	}
-	pterm.Success.Println("PLSA done")
-
-	pterm.DefaultSection.Println("Compiling")
-	compiler := filepath.Join(binPath, "compiler")
-	if runtime.GOOS == "windows" {
-		compiler += ".exe"
-	}
-	cmdComp := exec.Command(compiler, outputPre, outputObj)
-	if out, err := cmdComp.CombinedOutput(); err != nil {
-		handleError(outputPre, string(out))
-		os.Exit(1)
-	}
-	pterm.Success.Println("Compilation done")
-
-	// Linking similar to virac
-	pterm.DefaultSection.Println("Linking")
-	linker := "gcc"
-	outputExe := "bin/" + config.Package.Name
-	if runtime.GOOS == "windows" {
-		linker = "link.exe"
-		outputExe += ".exe"
-		cmdLink := exec.Command(linker, "/OUT:"+outputExe, outputObj)
-		if out, err := cmdLink.CombinedOutput(); err != nil {
-			pterm.Error.Println(string(out))
-			os.Exit(1)
-		}
-	} else {
-		if err := os.MkdirAll("bin", 0755); err != nil {
-			pterm.Error.Println(err)
-			os.Exit(1)
-		}
-		cmdLink := exec.Command(linker, outputObj, "-o", outputExe)
-		if out, err := cmdLink.CombinedOutput(); err != nil {
-			pterm.Error.Println(string(out))
-			os.Exit(1)
+		if ext == ".vira" || ext == ".c" || ext == ".cpp" {
+			if err := compileSourceInContainer(conn, containerID, containerInput, containerO, []string{}, ext); err != nil {
+				os.Exit(1)
+			}
+			objectFilesContainer = append(objectFilesContainer, containerO)
 		}
 	}
+
+	containerInput := "/work/src/main.vira"
+	containerMainO := "/work/main.o"
+	includeFlagsContainer := []string{}
+	for _, depPath := range depPaths {
+		containerDepPath := strings.Replace(depPath, tempDir, "/work", 1)
+		includeFlagsContainer = append(includeFlagsContainer, "-I"+containerDepPath)
+	}
+
+	if err := compileSourceInContainer(conn, containerID, containerInput, containerMainO, includeFlagsContainer, ".vira"); err != nil {
+		os.Exit(1)
+	}
+
+	objectFilesContainer = append(objectFilesContainer, containerMainO)
+
+	outputExeContainer := "/work/bin/" + config.Package.Name
+	// TODO: windows support
+	cmdLink := append([]string{"gcc"}, objectFilesContainer...)
+	cmdLink = append(cmdLink, "-o", outputExeContainer)
+
+	out, exit, err = execInContainer(conn, containerID, cmdLink)
+	if err != nil || exit != 0 {
+		pterm.Error.Println("Linking failed:", out)
+		os.Exit(1)
+	}
+
 	pterm.Success.Println("Linking done")
+
+	localBinDir := "bin"
+	if err := os.MkdirAll(localBinDir, 0755); err != nil {
+		pterm.Error.Println(err)
+		os.Exit(1)
+	}
+
+	localExe := filepath.Join(localBinDir, config.Package.Name)
+	if runtime.GOOS == "windows" {
+		localExe += ".exe"
+	}
+
+	if err := copyFile(filepath.Join(tempDir, "bin", config.Package.Name), localExe); err != nil {
+		pterm.Error.Println("Failed to copy executable:", err)
+		os.Exit(1)
+	}
+
+	pterm.Success.Println("Compilation complete")
+}
+
+func compileSourceInContainer(conn context.Context, containerID, input, output string, includeFlags []string, ext string) error {
+	pterm.DefaultSection.Println("Compiling source:", input)
+
+	if ext == ".vira" {
+		preOut := input + ".pre"
+		cmdPre := append([]string{"preprocessor"}, includeFlags...)
+		cmdPre = append(cmdPre, input, preOut)
+
+		out, exit, err := execInContainer(conn, containerID, cmdPre)
+		if err != nil || exit != 0 {
+			handleError(strings.Replace(input, "/work", tempDir, 1), out)
+			return fmt.Errorf("preprocess failed: %s", out)
+		}
+		pterm.Success.Println("Preprocessing done")
+
+		cmdPlsa := []string{"plsa", preOut}
+		out, exit, err = execInContainer(conn, containerID, cmdPlsa)
+		if err != nil || exit != 0 {
+			handleError(strings.Replace(preOut, "/work", tempDir, 1), out)
+			return fmt.Errorf("plsa failed: %s", out)
+		}
+		pterm.Success.Println("PLSA done")
+
+		cmdComp := []string{"compiler", preOut, output}
+		out, exit, err = execInContainer(conn, containerID, cmdComp)
+		if err != nil || exit != 0 {
+			handleError(strings.Replace(preOut, "/work", tempDir, 1), out)
+			return fmt.Errorf("compile failed: %s", out)
+		}
+		pterm.Success.Println("Compilation done")
+
+	} else if ext == ".c" {
+		cmd := append([]string{"gcc", "-c"}, includeFlags...)
+		cmd = append(cmd, input, "-o", output)
+
+		out, exit, err := execInContainer(conn, containerID, cmd)
+		if err != nil || exit != 0 {
+			handleError(strings.Replace(input, "/work", tempDir, 1), out)
+			return fmt.Errorf("gcc failed: %s", out)
+		}
+		pterm.Success.Println("GCC compilation done")
+
+	} else if ext == ".cpp" {
+		cmd := append([]string{"g++", "-c"}, includeFlags...)
+		cmd = append(cmd, input, "-o", output)
+
+		out, exit, err := execInContainer(conn, containerID, cmd)
+		if err != nil || exit != 0 {
+			handleError(strings.Replace(input, "/work", tempDir, 1), out)
+			return fmt.Errorf("g++ failed: %s", out)
+		}
+		pterm.Success.Println("G++ compilation done")
+	}
+
+	return nil
+}
+
+func execInContainer(conn context.Context, containerID string, cmd []string) (string, int, error) {
+	execConfig := entities.ExecCreateConfig{
+		AttachStdout: true,
+		AttachStderr: true,
+		Cmd:          cmd,
+		Env:          []string{"PATH=/vira-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+		WorkingDir:   "/work",
+	}
+
+	execID, err := containers.ExecCreate(conn, containerID, &execConfig)
+	if err != nil {
+		return "", -1, err
+	}
+
+	var buf bytes.Buffer
+	attachOpt := entities.ExecStartAndAttachOptions{
+		OutputStream: &buf,
+		ErrorStream:  &buf,
+		AttachOutput: true,
+		AttachError:  true,
+	}
+
+	err = containers.ExecStartAndAttach(conn, execID, &attachOpt)
+	if err != nil {
+		return buf.String(), -1, err
+	}
+
+	inspect, err := containers.ExecInspect(conn, execID, nil)
+	if err != nil {
+		return buf.String(), -1, err
+	}
+
+	return buf.String(), inspect.ExitCode, nil
+}
+
+func findProjectFile() string {
+	if _, err := os.Stat(projectTOML); err == nil {
+		return projectTOML
+	}
+	if _, err := os.Stat(projectYAML); err == nil {
+		return projectYAML
+	}
+	if _, err := os.Stat(projectJSON); err == nil {
+		return projectJSON
+	}
+	return ""
+}
+
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0644)
+}
+
+func copyDir(srcDir, dstDir string) error {
+	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		relPath, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(dstDir, relPath)
+		if info.IsDir() {
+			return os.Mkdir(dstPath, info.Mode())
+		}
+		return copyFile(path, dstPath)
+	})
 }
 
 func loadConfig() (Config, error) {
 	var config Config
-	var data []byte
-	var err error
-
-	if _, err = os.Stat(projectTOML); err == nil {
-		data, err = os.ReadFile(projectTOML)
-		if err != nil {
-			return config, err
-		}
-		err = toml.Unmarshal(data, &config)
-	} else if _, err = os.Stat(projectYAML); err == nil {
-		data, err = os.ReadFile(projectYAML)
-		if err != nil {
-			return config, err
-		}
-		err = yaml.Unmarshal(data, &config)
-	} else if _, err = os.Stat(projectJSON); err == nil {
-		data, err = os.ReadFile(projectJSON)
-		if err != nil {
-			return config, err
-		}
-		err = json.Unmarshal(data, &config)
-	} else {
+	projectFile := findProjectFile()
+	if projectFile == "" {
 		return config, fmt.Errorf("no project file found")
 	}
-
+	data, err := os.ReadFile(projectFile)
 	if err != nil {
 		return config, err
 	}
-
-	return config, nil
+	ext := filepath.Ext(projectFile)
+	switch ext {
+		case ".toml":
+			err = toml.Unmarshal(data, &config)
+		case ".yaml":
+			err = yaml.Unmarshal(data, &config)
+		case ".json":
+			err = json.Unmarshal(data, &config)
+	}
+	return config, err
 }
 
 func saveConfig(config Config) error {
@@ -360,7 +550,6 @@ func findLibrary(index LibraryIndex, name string) *Library {
 }
 
 func resolveVersion(versions []Version, spec string) *Version {
-	// Simple resolution: if "*", take latest; if exact, match; if ^, semver prefix
 	if spec == "*" {
 		if len(versions) > 0 {
 			return &versions[len(versions)-1]
@@ -400,18 +589,18 @@ func downloadWithProgress(url, target string) error {
 	bar := progressbar.NewOptions64(
 		resp.ContentLength,
 		progressbar.OptionSetDescription("Downloading"),
-		progressbar.OptionSetWriter(os.Stderr),
-		progressbar.OptionSetWidth(30),
-		progressbar.OptionThrottle(0),
-		progressbar.OptionShowCount(),
-		progressbar.OptionShowIts(),
-		progressbar.OptionOnCompletion(func() {
-			fmt.Fprint(os.Stderr, "\n")
-		}),
-		progressbar.OptionSpinnerType(14),
-		progressbar.OptionFullWidth(),
-		progressbar.OptionSetRenderBlankState(true),
-		progressbar.OptionUseANSICodes(true),
+					progressbar.OptionSetWriter(os.Stderr),
+					progressbar.OptionSetWidth(30),
+					progressbar.OptionThrottle(0),
+					progressbar.OptionShowCount(),
+					progressbar.OptionShowIts(),
+					progressbar.OptionOnCompletion(func() {
+						fmt.Fprint(os.Stderr, "\n")
+					}),
+				 progressbar.OptionSpinnerType(14),
+					progressbar.OptionFullWidth(),
+					progressbar.OptionSetRenderBlankState(true),
+					progressbar.OptionUseANSICodes(true),
 	)
 	bar.RenderBlank()
 
@@ -422,16 +611,14 @@ func downloadWithProgress(url, target string) error {
 func handleError(sourceFile, errorMsg string) {
 	pterm.Error.Println("Error occurred. Running diagnostic...")
 
-	// Mock parsing error for line, column, message
 	lines := strings.Split(errorMsg, "\n")
 	var message string
 	line := 1
 	column := 1
+
 	if len(lines) > 0 {
 		message = lines[0]
-		// Parse if format like "line X, column Y: msg"
 		if strings.Contains(message, "line") {
-			// Simple parse
 			fmt.Sscanf(message, "line %d, column %d", &line, &column)
 		}
 	}
@@ -440,12 +627,14 @@ func handleError(sourceFile, errorMsg string) {
 	if runtime.GOOS == "windows" {
 		diagnostic += ".exe"
 	}
+
 	cmdDiag := exec.Command(diagnostic,
-		"--source", sourceFile,
-		"--message", message,
-		"--line", fmt.Sprintf("%d", line),
-		"--column", fmt.Sprintf("%d", column),
+				"--source", sourceFile,
+			 "--message", message,
+			 "--line", fmt.Sprintf("%d", line),
+				"--column", fmt.Sprintf("%d", column),
 	)
+
 	out, err := cmdDiag.CombinedOutput()
 	if err != nil {
 		pterm.Error.Println(string(out))
