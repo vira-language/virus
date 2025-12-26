@@ -13,37 +13,35 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/containers/podman/v5/pkg/api/handlers"
 	"github.com/containers/podman/v5/pkg/bindings"
 	"github.com/containers/podman/v5/pkg/bindings/containers"
 	"github.com/containers/podman/v5/pkg/bindings/images"
-	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pterm/pterm"
 	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 )
 
 const (
 	indexURL     = "https://raw.githubusercontent.com/vira-language/vira/main/repository/virus.json"
 	depsDir      = ".virus_deps"
 	projectTOML  = "Project.toml"
-	projectYAML  = "Project.yaml"
-	projectJSON  = "Project.json"
 	wolfiImage   = "cgr.dev/chainguard/wolfi-base:latest"
 )
 
 var binPath string
 
 type Config struct {
-	Package      Package           `toml:"package" yaml:"package" json:"package"`
-	Dependencies map[string]string `toml:"dependencies" yaml:"dependencies" json:"dependencies"`
+	Package      Package           `toml:"package"`
+	Dependencies map[string]string `toml:"dependencies"`
 }
 
 type Package struct {
-	Name    string `toml:"name" yaml:"name" json:"name"`
-	Version string `toml:"version" yaml:"version" json:"version"`
+	Name    string `toml:"name"`
+	Version string `toml:"version"`
 }
 
 type LibraryIndex struct {
@@ -142,15 +140,15 @@ func initProject() {
 	}
 
 	mainCode := `int main() {
-	return 0;
+return 0;
 }
 `
-if err := os.WriteFile("src/main.vira", []byte(mainCode), 0644); err != nil {
-	pterm.Error.Println("Failed to write main.vira:", err)
-	os.Exit(1)
-}
+	if err := os.WriteFile("src/main.vira", []byte(mainCode), 0644); err != nil {
+		pterm.Error.Println("Failed to write main.vira:", err)
+		os.Exit(1)
+	}
 
-pterm.Success.Println("Project initialized")
+	pterm.Success.Println("Project initialized")
 }
 
 func addDependency(lib string) {
@@ -232,13 +230,8 @@ func compileProject() {
 		os.Exit(1)
 	}
 
-	s, err := specgen.NewSpecGenerator(wolfiImage, false)
-	if err != nil {
-		pterm.Error.Println("Failed to create spec:", err)
-		os.Exit(1)
-	}
-
-	s.Mounts = []specgen.Mount{
+	s := specgen.NewSpecGenerator(wolfiImage, false)
+	s.Mounts = []specs.Mount{
 		{Type: "bind", Source: tempDir, Destination: "/work", Options: []string{"rw"}},
 		{Type: "bind", Source: binPath, Destination: "/vira-bin", Options: []string{"ro"}},
 	}
@@ -312,7 +305,7 @@ func compileProject() {
 		containerO := strings.Replace(depPath, tempDir, "/work", 1) + "/lib.o"
 
 		if ext == ".vira" || ext == ".c" || ext == ".cpp" {
-			if err := compileSourceInContainer(conn, containerID, containerInput, containerO, []string{}, ext); err != nil {
+			if err := compileSourceInContainer(conn, containerID, containerInput, containerO, []string{}, ext, tempDir); err != nil {
 				os.Exit(1)
 			}
 			objectFilesContainer = append(objectFilesContainer, containerO)
@@ -321,13 +314,14 @@ func compileProject() {
 
 	containerInput := "/work/src/main.vira"
 	containerMainO := "/work/main.o"
+
 	includeFlagsContainer := []string{}
 	for _, depPath := range depPaths {
 		containerDepPath := strings.Replace(depPath, tempDir, "/work", 1)
 		includeFlagsContainer = append(includeFlagsContainer, "-I"+containerDepPath)
 	}
 
-	if err := compileSourceInContainer(conn, containerID, containerInput, containerMainO, includeFlagsContainer, ".vira"); err != nil {
+	if err := compileSourceInContainer(conn, containerID, containerInput, containerMainO, includeFlagsContainer, ".vira", tempDir); err != nil {
 		os.Exit(1)
 	}
 
@@ -365,7 +359,7 @@ func compileProject() {
 	pterm.Success.Println("Compilation complete")
 }
 
-func compileSourceInContainer(conn context.Context, containerID, input, output string, includeFlags []string, ext string) error {
+func compileSourceInContainer(conn context.Context, containerID, input, output string, includeFlags []string, ext string, tempDir string) error {
 	pterm.DefaultSection.Println("Compiling source:", input)
 
 	if ext == ".vira" {
@@ -395,7 +389,6 @@ func compileSourceInContainer(conn context.Context, containerID, input, output s
 			return fmt.Errorf("compile failed: %s", out)
 		}
 		pterm.Success.Println("Compilation done")
-
 	} else if ext == ".c" {
 		cmd := append([]string{"gcc", "-c"}, includeFlags...)
 		cmd = append(cmd, input, "-o", output)
@@ -406,7 +399,6 @@ func compileSourceInContainer(conn context.Context, containerID, input, output s
 			return fmt.Errorf("gcc failed: %s", out)
 		}
 		pterm.Success.Println("GCC compilation done")
-
 	} else if ext == ".cpp" {
 		cmd := append([]string{"g++", "-c"}, includeFlags...)
 		cmd = append(cmd, input, "-o", output)
@@ -423,25 +415,29 @@ func compileSourceInContainer(conn context.Context, containerID, input, output s
 }
 
 func execInContainer(conn context.Context, containerID string, cmd []string) (string, int, error) {
-	execConfig := entities.ExecCreateConfig{
-		AttachStdout: true,
-		AttachStderr: true,
-		Cmd:          cmd,
-		Env:          []string{"PATH=/vira-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
-		WorkingDir:   "/work",
-	}
+	execConfig := new(handlers.ExecCreateConfig)
+	execConfig.Cmd = cmd
+	execConfig.Env = []string{"PATH=/vira-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+	execConfig.User = ""
+	execConfig.WorkingDir = "/work"
+	execConfig.AttachStderr = true
+	execConfig.AttachStdout = true
+	execConfig.AttachStdin = false
+	execConfig.Tty = false
 
-	execID, err := containers.ExecCreate(conn, containerID, &execConfig)
+	execID, err := containers.ExecCreate(conn, containerID, execConfig)
 	if err != nil {
 		return "", -1, err
 	}
 
 	var buf bytes.Buffer
-	attachOpt := entities.ExecStartAndAttachOptions{
-		OutputStream: &buf,
-		ErrorStream:  &buf,
-		AttachOutput: true,
-		AttachError:  true,
+	var outputStream io.Writer = &buf
+	var errorStream io.Writer = &buf
+
+	attachOpt := containers.ExecStartAndAttachOptions{
+		OutputStream: &outputStream,
+		ErrorStream:  &errorStream,
+		InputStream:  nil,
 	}
 
 	err = containers.ExecStartAndAttach(conn, execID, &attachOpt)
@@ -460,12 +456,6 @@ func execInContainer(conn context.Context, containerID string, cmd []string) (st
 func findProjectFile() string {
 	if _, err := os.Stat(projectTOML); err == nil {
 		return projectTOML
-	}
-	if _, err := os.Stat(projectYAML); err == nil {
-		return projectYAML
-	}
-	if _, err := os.Stat(projectJSON); err == nil {
-		return projectJSON
 	}
 	return ""
 }
@@ -505,15 +495,7 @@ func loadConfig() (Config, error) {
 	if err != nil {
 		return config, err
 	}
-	ext := filepath.Ext(projectFile)
-	switch ext {
-		case ".toml":
-			err = toml.Unmarshal(data, &config)
-		case ".yaml":
-			err = yaml.Unmarshal(data, &config)
-		case ".json":
-			err = json.Unmarshal(data, &config)
-	}
+	err = toml.Unmarshal(data, &config)
 	return config, err
 }
 
@@ -579,62 +561,54 @@ func downloadWithProgress(url, target string) error {
 		return err
 	}
 	defer resp.Body.Close()
-
 	f, err := os.Create(target)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
 	bar := progressbar.NewOptions64(
 		resp.ContentLength,
 		progressbar.OptionSetDescription("Downloading"),
-					progressbar.OptionSetWriter(os.Stderr),
-					progressbar.OptionSetWidth(30),
-					progressbar.OptionThrottle(0),
-					progressbar.OptionShowCount(),
-					progressbar.OptionShowIts(),
-					progressbar.OptionOnCompletion(func() {
-						fmt.Fprint(os.Stderr, "\n")
-					}),
-				 progressbar.OptionSpinnerType(14),
-					progressbar.OptionFullWidth(),
-					progressbar.OptionSetRenderBlankState(true),
-					progressbar.OptionUseANSICodes(true),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionSetWidth(30),
+		progressbar.OptionThrottle(0),
+		progressbar.OptionShowCount(),
+		progressbar.OptionShowIts(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(os.Stderr, "\n")
+		}),
+		progressbar.OptionSpinnerType(14),
+		progressbar.OptionFullWidth(),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionUseANSICodes(true),
 	)
 	bar.RenderBlank()
-
 	_, err = io.Copy(io.MultiWriter(f, bar), resp.Body)
 	return err
 }
 
 func handleError(sourceFile, errorMsg string) {
 	pterm.Error.Println("Error occurred. Running diagnostic...")
-
 	lines := strings.Split(errorMsg, "\n")
 	var message string
 	line := 1
 	column := 1
-
 	if len(lines) > 0 {
 		message = lines[0]
 		if strings.Contains(message, "line") {
 			fmt.Sscanf(message, "line %d, column %d", &line, &column)
 		}
 	}
-
 	diagnostic := filepath.Join(binPath, "diagnostic")
 	if runtime.GOOS == "windows" {
 		diagnostic += ".exe"
 	}
-
 	cmdDiag := exec.Command(diagnostic,
-				"--source", sourceFile,
-			 "--message", message,
-			 "--line", fmt.Sprintf("%d", line),
-				"--column", fmt.Sprintf("%d", column),
+		"--source", sourceFile,
+		"--message", message,
+		"--line", fmt.Sprintf("%d", line),
+		"--column", fmt.Sprintf("%d", column),
 	)
-
 	out, err := cmdDiag.CombinedOutput()
 	if err != nil {
 		pterm.Error.Println(string(out))
