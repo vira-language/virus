@@ -26,10 +26,10 @@ import (
 )
 
 const (
-	indexURL     = "https://raw.githubusercontent.com/vira-language/vira/main/repository/virus.json"
-	depsDir      = ".virus_deps"
-	projectTOML  = "Project.toml"
-	wolfiImage   = "cgr.dev/chainguard/wolfi-base:latest"
+	indexURL    = "https://raw.githubusercontent.com/vira-language/vira/main/repository/virus.json"
+	depsDir     = ".virus_deps"
+	projectTOML = "Project.toml"
+	wolfiImage  = "cgr.dev/chainguard/wolfi-base:latest"
 )
 
 var binPath string
@@ -49,7 +49,7 @@ type LibraryIndex struct {
 }
 
 type Library struct {
-	Name     string   `json:"name"`
+	Name     string    `json:"name"`
 	Versions []Version `json:"versions"`
 }
 
@@ -114,7 +114,6 @@ func main() {
 
 func initProject() {
 	pterm.DefaultSection.Println("Initializing Vira project")
-
 	config := Config{
 		Package: Package{
 			Name:    "myproject",
@@ -122,114 +121,99 @@ func initProject() {
 		},
 		Dependencies: make(map[string]string),
 	}
-
 	data, err := toml.Marshal(config)
 	if err != nil {
 		pterm.Error.Println("Failed to marshal config:", err)
 		os.Exit(1)
 	}
-
 	if err := os.WriteFile(projectTOML, data, 0644); err != nil {
 		pterm.Error.Println("Failed to write Project.toml:", err)
 		os.Exit(1)
 	}
-
 	if err := os.MkdirAll("src", 0755); err != nil {
 		pterm.Error.Println("Failed to create src dir:", err)
 		os.Exit(1)
 	}
-
 	mainCode := `int main() {
-return 0;
+	return 0;
 }
 `
 	if err := os.WriteFile("src/main.vira", []byte(mainCode), 0644); err != nil {
 		pterm.Error.Println("Failed to write main.vira:", err)
 		os.Exit(1)
 	}
-
 	pterm.Success.Println("Project initialized")
 }
 
 func addDependency(lib string) {
 	pterm.DefaultSection.Println("Adding dependency:", lib)
-
 	config, err := loadConfig()
 	if err != nil {
 		pterm.Error.Println(err)
 		os.Exit(1)
 	}
-
 	config.Dependencies[lib] = "*"
-
 	if err := saveConfig(config); err != nil {
 		pterm.Error.Println(err)
 		os.Exit(1)
 	}
-
 	pterm.Success.Println("Dependency added")
 }
 
 func compileProject() {
 	pterm.DefaultSection.Println("Compiling Vira project")
-
 	config, err := loadConfig()
 	if err != nil {
 		pterm.Error.Println(err)
 		os.Exit(1)
 	}
-
 	tempDir, err := os.MkdirTemp("", "virus-build-*")
 	if err != nil {
 		pterm.Error.Println("Failed to create temp dir:", err)
 		os.Exit(1)
 	}
 	defer os.RemoveAll(tempDir)
-
 	projectFile := findProjectFile()
 	if projectFile == "" {
 		pterm.Error.Println("No project file found")
 		os.Exit(1)
 	}
-
 	if err := copyFile(projectFile, filepath.Join(tempDir, filepath.Base(projectFile))); err != nil {
 		pterm.Error.Println("Failed to copy project file:", err)
 		os.Exit(1)
 	}
-
 	if err := copyDir("src", filepath.Join(tempDir, "src")); err != nil {
 		pterm.Error.Println("Failed to copy src dir:", err)
 		os.Exit(1)
 	}
-
 	depsDirTemp := filepath.Join(tempDir, depsDir)
 	if err := os.MkdirAll(depsDirTemp, 0755); err != nil {
 		pterm.Error.Println("Failed to create deps dir:", err)
 		os.Exit(1)
 	}
-
 	index, err := downloadIndex()
 	if err != nil {
 		pterm.Error.Println("Failed to download index:", err)
 		os.Exit(1)
 	}
-
 	depPaths := []string{}
 	objectFilesContainer := []string{}
-
 	ctx := context.Background()
-	conn, err := bindings.NewConnection(ctx, "unix:///run/podman/podman.sock")
+	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	if runtimeDir == "" {
+		runtimeDir = fmt.Sprintf("/run/user/%d", os.Getuid())
+	}
+	socketPath := fmt.Sprintf("unix://%s/podman/podman.sock", runtimeDir)
+	conn, err := bindings.NewConnection(ctx, socketPath)
 	if err != nil {
 		pterm.Error.Println("Failed to connect to Podman:", err)
 		os.Exit(1)
 	}
-
 	_, err = images.Pull(conn, wolfiImage, nil)
 	if err != nil {
 		pterm.Error.Println("Failed to pull Wolfi image:", err)
 		os.Exit(1)
 	}
-
 	s := specgen.NewSpecGenerator(wolfiImage, false)
 	s.Mounts = []specs.Mount{
 		{Type: "bind", Source: tempDir, Destination: "/work", Options: []string{"rw"}},
@@ -237,59 +221,48 @@ func compileProject() {
 	}
 	s.WorkDir = "/work"
 	s.Command = []string{"/bin/sh", "-c", "while true; do sleep 100000; done"}
-
 	created, err := containers.CreateWithSpec(conn, s, nil)
 	if err != nil {
 		pterm.Error.Println("Failed to create container:", err)
 		os.Exit(1)
 	}
-
 	containerID := created.ID
-
 	if err := containers.Start(conn, containerID, nil); err != nil {
 		pterm.Error.Println("Failed to start container:", err)
 		os.Exit(1)
 	}
-
 	defer func() {
 		containers.Stop(conn, containerID, nil)
 		containers.Remove(conn, containerID, nil)
 	}()
-
 	out, exit, err := execInContainer(conn, containerID, []string{"apk", "update"})
 	if err != nil || exit != 0 {
 		pterm.Error.Println("apk update failed:", out, err)
 		os.Exit(1)
 	}
-
 	out, exit, err = execInContainer(conn, containerID, []string{"apk", "add", "--no-cache", "build-base", "gcc", "g++"})
 	if err != nil || exit != 0 {
 		pterm.Error.Println("apk add failed:", out, err)
 		os.Exit(1)
 	}
-
 	for name, versionSpec := range config.Dependencies {
 		lib := findLibrary(index, name)
 		if lib == nil {
 			pterm.Error.Println("Library not found:", name)
 			os.Exit(1)
 		}
-
 		version := resolveVersion(lib.Versions, versionSpec)
 		if version == nil {
 			pterm.Error.Println("No matching version for", name, versionSpec)
 			os.Exit(1)
 		}
-
 		depPath := filepath.Join(depsDirTemp, name, version.Version)
 		if err := os.MkdirAll(depPath, 0755); err != nil {
 			pterm.Error.Println("Failed to create dep path:", err)
 			os.Exit(1)
 		}
-
 		fileName := filepath.Base(version.URL)
 		targetFile := filepath.Join(depPath, fileName)
-
 		if _, err := os.Stat(targetFile); os.IsNotExist(err) {
 			pterm.Info.Println("Downloading", name, version.Version)
 			if err := downloadWithProgress(version.URL, targetFile); err != nil {
@@ -297,83 +270,66 @@ func compileProject() {
 				os.Exit(1)
 			}
 		}
-
 		depPaths = append(depPaths, depPath)
-
 		ext := strings.ToLower(filepath.Ext(fileName))
 		containerInput := strings.Replace(targetFile, tempDir, "/work", 1)
 		containerO := strings.Replace(depPath, tempDir, "/work", 1) + "/lib.o"
-
 		if ext == ".vira" || ext == ".c" || ext == ".cpp" {
-			if err := compileSourceInContainer(conn, containerID, containerInput, containerO, []string{}, ext, tempDir); err != nil {
+			if err := compileSourceInContainer(ctx, containerID, containerInput, containerO, []string{}, ext, tempDir); err != nil {
 				os.Exit(1)
 			}
 			objectFilesContainer = append(objectFilesContainer, containerO)
 		}
 	}
-
 	containerInput := "/work/src/main.vira"
 	containerMainO := "/work/main.o"
-
 	includeFlagsContainer := []string{}
 	for _, depPath := range depPaths {
 		containerDepPath := strings.Replace(depPath, tempDir, "/work", 1)
 		includeFlagsContainer = append(includeFlagsContainer, "-I"+containerDepPath)
 	}
-
-	if err := compileSourceInContainer(conn, containerID, containerInput, containerMainO, includeFlagsContainer, ".vira", tempDir); err != nil {
+	if err := compileSourceInContainer(ctx, containerID, containerInput, containerMainO, includeFlagsContainer, ".vira", tempDir); err != nil {
 		os.Exit(1)
 	}
-
 	objectFilesContainer = append(objectFilesContainer, containerMainO)
-
 	outputExeContainer := "/work/bin/" + config.Package.Name
 	// TODO: windows support
 	cmdLink := append([]string{"gcc"}, objectFilesContainer...)
 	cmdLink = append(cmdLink, "-o", outputExeContainer)
-
 	out, exit, err = execInContainer(conn, containerID, cmdLink)
 	if err != nil || exit != 0 {
 		pterm.Error.Println("Linking failed:", out)
 		os.Exit(1)
 	}
-
 	pterm.Success.Println("Linking done")
-
 	localBinDir := "bin"
 	if err := os.MkdirAll(localBinDir, 0755); err != nil {
 		pterm.Error.Println(err)
 		os.Exit(1)
 	}
-
 	localExe := filepath.Join(localBinDir, config.Package.Name)
 	if runtime.GOOS == "windows" {
 		localExe += ".exe"
 	}
-
 	if err := copyFile(filepath.Join(tempDir, "bin", config.Package.Name), localExe); err != nil {
 		pterm.Error.Println("Failed to copy executable:", err)
 		os.Exit(1)
 	}
-
 	pterm.Success.Println("Compilation complete")
 }
 
 func compileSourceInContainer(conn context.Context, containerID, input, output string, includeFlags []string, ext string, tempDir string) error {
 	pterm.DefaultSection.Println("Compiling source:", input)
-
 	if ext == ".vira" {
 		preOut := input + ".pre"
 		cmdPre := append([]string{"preprocessor"}, includeFlags...)
 		cmdPre = append(cmdPre, input, preOut)
-
 		out, exit, err := execInContainer(conn, containerID, cmdPre)
 		if err != nil || exit != 0 {
 			handleError(strings.Replace(input, "/work", tempDir, 1), out)
 			return fmt.Errorf("preprocess failed: %s", out)
 		}
 		pterm.Success.Println("Preprocessing done")
-
 		cmdPlsa := []string{"plsa", preOut}
 		out, exit, err = execInContainer(conn, containerID, cmdPlsa)
 		if err != nil || exit != 0 {
@@ -381,7 +337,6 @@ func compileSourceInContainer(conn context.Context, containerID, input, output s
 			return fmt.Errorf("plsa failed: %s", out)
 		}
 		pterm.Success.Println("PLSA done")
-
 		cmdComp := []string{"compiler", preOut, output}
 		out, exit, err = execInContainer(conn, containerID, cmdComp)
 		if err != nil || exit != 0 {
@@ -392,7 +347,6 @@ func compileSourceInContainer(conn context.Context, containerID, input, output s
 	} else if ext == ".c" {
 		cmd := append([]string{"gcc", "-c"}, includeFlags...)
 		cmd = append(cmd, input, "-o", output)
-
 		out, exit, err := execInContainer(conn, containerID, cmd)
 		if err != nil || exit != 0 {
 			handleError(strings.Replace(input, "/work", tempDir, 1), out)
@@ -402,7 +356,6 @@ func compileSourceInContainer(conn context.Context, containerID, input, output s
 	} else if ext == ".cpp" {
 		cmd := append([]string{"g++", "-c"}, includeFlags...)
 		cmd = append(cmd, input, "-o", output)
-
 		out, exit, err := execInContainer(conn, containerID, cmd)
 		if err != nil || exit != 0 {
 			handleError(strings.Replace(input, "/work", tempDir, 1), out)
@@ -410,7 +363,6 @@ func compileSourceInContainer(conn context.Context, containerID, input, output s
 		}
 		pterm.Success.Println("G++ compilation done")
 	}
-
 	return nil
 }
 
@@ -424,32 +376,26 @@ func execInContainer(conn context.Context, containerID string, cmd []string) (st
 	execConfig.AttachStdout = true
 	execConfig.AttachStdin = false
 	execConfig.Tty = false
-
 	execID, err := containers.ExecCreate(conn, containerID, execConfig)
 	if err != nil {
 		return "", -1, err
 	}
-
 	var buf bytes.Buffer
 	var outputStream io.Writer = &buf
 	var errorStream io.Writer = &buf
-
 	attachOpt := containers.ExecStartAndAttachOptions{
 		OutputStream: &outputStream,
 		ErrorStream:  &errorStream,
 		InputStream:  nil,
 	}
-
 	err = containers.ExecStartAndAttach(conn, execID, &attachOpt)
 	if err != nil {
 		return buf.String(), -1, err
 	}
-
 	inspect, err := containers.ExecInspect(conn, execID, nil)
 	if err != nil {
 		return buf.String(), -1, err
 	}
-
 	return buf.String(), inspect.ExitCode, nil
 }
 
